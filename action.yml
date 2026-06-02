@@ -1,0 +1,60 @@
+name: 'Superjolt Deploy'
+description: 'Deploy code from GitHub Actions to a Superjolt VM via API token. Uploads files, runs commands. No SSH key needed.'
+author: 'Superjolt'
+branding:
+  icon: 'upload-cloud'
+  color: 'blue'
+
+inputs:
+  token:
+    description: 'Superjolt API token (sj_live_…). Mint in the dashboard → Settings → API keys → Create; store as a GitHub Secret named SUPERJOLT_TOKEN.'
+    required: true
+  api_url:
+    description: 'Override the Superjolt API base URL. Leave at the default for production.'
+    required: false
+    default: 'https://api.superjolt.com'
+  project:
+    description: 'Project name or id. Omit if the tenant has exactly one project.'
+    required: false
+    default: ''
+  vm:
+    description: 'VM name or id. The Action resolves names to ids via /v1/vms/resolve; 404 on ambiguity.'
+    required: true
+  upload:
+    description: 'Local path to ship to the VM. File or directory.'
+    required: false
+    default: ''
+  upload_to:
+    description: 'Absolute remote path the upload lands at. Defaults to /root/app.'
+    required: false
+    default: '/root/app'
+  command:
+    description: 'Shell command to run on the VM after the upload step finishes. Stdout/stderr stream to the workflow log; non-zero exit fails the step.'
+    required: false
+    default: ''
+  workdir:
+    description: 'Working directory for the command. Defaults to the upload_to path when upload is set, otherwise /root.'
+    required: false
+    default: ''
+
+outputs:
+  vm_id:
+    description: 'Resolved VM id (vm-…). Useful for chaining with other Superjolt actions.'
+    value: ${{ steps.deploy.outputs.vm_id }}
+
+runs:
+  using: composite
+  steps:
+    - id: deploy
+      shell: bash
+      env:
+        SUPERJOLT_TOKEN: ${{ inputs.token }}
+        SUPERJOLT_API_URL: ${{ inputs.api_url }}
+        INPUT_PROJECT: ${{ inputs.project }}
+        INPUT_VM: ${{ inputs.vm }}
+        INPUT_UPLOAD: ${{ inputs.upload }}
+        INPUT_UPLOAD_TO: ${{ inputs.upload_to }}
+        INPUT_COMMAND: ${{ inputs.command }}
+        INPUT_WORKDIR: ${{ inputs.workdir }}
+        ACTION_VERSION: '1.0.0'
+      run: ${{ github.action_path }}/deploy.sh

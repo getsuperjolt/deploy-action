@@ -1,0 +1,45 @@
+name: Release
+
+# Cuts a GitHub Release on every semver tag push and force-updates the
+# moving major tag (e.g. `v1`) to the same commit so `uses: …@v1` keeps
+# working. The Marketplace listing is drafted from the release form.
+
+on:
+  push:
+    tags:
+      - 'v[0-9]+.[0-9]+.[0-9]+'
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Create or update GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # Idempotent: a force-push to an existing semver tag re-runs
+          # this workflow, but `gh release create` 422s when the
+          # release row already exists. Detect + edit in place when it
+          # does so the moving-major step downstream still runs.
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            echo "Release $GITHUB_REF_NAME already exists — leaving notes as-is."
+          else
+            gh release create "$GITHUB_REF_NAME" \
+              --title "$GITHUB_REF_NAME" \
+              --generate-notes
+          fi
+
+      - name: Force-update moving major tag
+        run: |
+          MAJOR=$(echo "$GITHUB_REF_NAME" | cut -d. -f1)
+          git config user.name 'github-actions[bot]'
+          git config user.email 'github-actions[bot]@users.noreply.github.com'
+          git tag -fa "$MAJOR" -m "Update $MAJOR to $GITHUB_REF_NAME"
+          git push origin "$MAJOR" --force
