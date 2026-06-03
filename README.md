@@ -57,12 +57,14 @@ Token creation is dashboard-only by design — a leaked bearer can't mint shadow
 Pin to a semver release for stability — and follow [GitHub's post-tj-actions guidance](https://github.blog/changelog/2025-08-15-github-actions-policy-now-supports-blocking-and-sha-pinning-actions/) by pinning to a commit SHA in high-security orgs.
 
 ```yaml
-uses: getsuperjolt/deploy-action@v1.0.0   # immutable semver
+uses: getsuperjolt/deploy-action@v1.1.0   # immutable semver
 # or
 uses: getsuperjolt/deploy-action@<full-sha>  # most secure
 # or
 uses: getsuperjolt/deploy-action@v1          # moving major (convenient, not recommended for prod)
 ```
+
+**v1.1.0+ supports long-running deploys** via async exec — the action polls Superjolt's API every 2s and streams stdout/stderr to the workflow log as it accumulates. **v1.0.x users will see a 524** on commands that take longer than ~100s (the Cloudflare edge timeout) because the old action made a single synchronous curl. If you're on v1.0.x and seeing 524s on `npm install` or similar, bump to v1.1.0.
 
 ## Audit attribution
 
