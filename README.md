@@ -66,6 +66,8 @@ uses: getsuperjolt/deploy-action@v1          # moving major (convenient, not rec
 
 **v1.1.0+ supports long-running deploys** via async exec — the action polls Superjolt's API every 2s and streams stdout/stderr to the workflow log as it accumulates. **v1.0.x users will see a 524** on commands that take longer than ~100s (the Cloudflare edge timeout) because the old action made a single synchronous curl. If you're on v1.0.x and seeing 524s on `npm install` or similar, bump to v1.1.0.
 
+**v1.1.1** adds an automatic fallback to sync `/v1/exec` when the platform host hasn't been upgraded to the async-capable machine-agent yet (returns 503/501/404 on `/exec/async`). On the fallback path the 100s edge cap re-applies — the action prints a `::warning::` so it's obvious which path you're on — but short commands work either way. Also surfaces vm-init's `.error` field on non-zero exit so failures like `spawn ENOENT` or `Command timed out after 900000ms` show up in the workflow log instead of just `exit code -1`.
+
 ## Audit attribution
 
 Every API call from this action sends `User-Agent: superjolt-action/<version> (+https://github.com/getsuperjolt/deploy-action)`. Superjolt's audit service detects that header and stamps `metadata.source = 'github-actions'` on every audit row, so the dashboard activity feed renders a "via GitHub Actions" badge.

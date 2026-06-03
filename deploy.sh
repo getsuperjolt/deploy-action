@@ -86,73 +86,138 @@ if [[ -n "${INPUT_UPLOAD:-}" ]]; then
   fi
 fi
 
-# 3. exec command (if provided) — async path so long-running deploys
-#    (npm ci, builds) don't hit Cloudflare's ~100s edge timeout (524).
-#    POST starts the run, GET polls every 2s for incremental stdout/stderr.
+# 3. exec command (if provided) — try the async path first so long
+#    deploys (npm ci, builds) don't hit Cloudflare's ~100s edge timeout
+#    (524). If the platform host is still on the legacy machine-agent
+#    binary it will return 503 UNIMPLEMENTED; fall through to /v1/exec
+#    (sync) so the action stays useful behind a partial rollout. Short
+#    commands work on either path.
 if [[ -n "${INPUT_COMMAND:-}" ]]; then
   WORKDIR="${INPUT_WORKDIR:-${INPUT_UPLOAD_TO:-/root}}"
   echo "Running command on $VM_ID (workdir=$WORKDIR)..."
 
-  START_RES=$(curl -fsS -X POST -H "$AUTH" -H "User-Agent: $UA" -H "Content-Type: application/json" \
+  # capture body + http status without `-f` (we need to read the body
+  # for fallback decisions even on non-2xx responses).
+  # IMPORTANT: bash only keeps ONE EXIT trap. The upload-directory
+  # branch above may have set `trap 'rm -f "$TGZ"' EXIT`; we must
+  # preserve that here or its tarball leaks on self-hosted runners
+  # with persistent /tmp. Both vars are quoted with :- so an unset
+  # one expands to a harmless empty string.
+  START_BODY=$(mktemp)
+  trap 'rm -f "${TGZ:-}" "${START_BODY:-}"' EXIT
+  START_HTTP=$(curl -sS -o "$START_BODY" -w '%{http_code}' \
+    -X POST -H "$AUTH" -H "User-Agent: $UA" -H "Content-Type: application/json" \
     -d "$(jq -n --arg c "$INPUT_COMMAND" --arg w "$WORKDIR" \
          '{command: $c, workdir: $w, timeoutMs: 1800000}')" \
-    "${SUPERJOLT_API_URL%/}/v1/vms/${VM_ID}/exec/async")
-  EXEC_ID=$(echo "$START_RES" | jq -r '.execId // ""')
-  if [[ -z "$EXEC_ID" ]]; then
-    echo "::error::exec/async returned no execId: $START_RES"
-    exit 1
-  fi
+    "${SUPERJOLT_API_URL%/}/v1/vms/${VM_ID}/exec/async") || {
+      echo "::error::exec/async transport failed: $(cat "$START_BODY" 2>/dev/null || true)"
+      exit 1
+    }
 
-  # Trap SIGTERM/SIGINT (the workflow runner sends these on cancel) so
-  # the underlying child gets SIGTERM-then-SIGKILL on vm-init instead
-  # of leaking. Best-effort: if the DELETE fails we still exit.
-  cleanup_exec() {
-    curl -fsS -X DELETE -H "$AUTH" -H "User-Agent: $UA" \
-      "${SUPERJOLT_API_URL%/}/v1/vms/${VM_ID}/exec/${EXEC_ID}" >/dev/null 2>&1 || true
-  }
-  trap 'cleanup_exec; exit 130' INT TERM
+  ASYNC_AVAILABLE=true
+  case "$START_HTTP" in
+    200|201)
+      ;;
+    404|501|503)
+      # Host hasn't been upgraded to the async-capable machine-agent
+      # build. Fall back to sync /exec. The 100s edge timeout applies
+      # on this path — commands longer than that will 524.
+      echo "::warning::Async exec unavailable on this host (HTTP $START_HTTP) — falling back to sync /v1/exec. Commands longer than ~100s will 524 at the edge until the host is upgraded."
+      ASYNC_AVAILABLE=false
+      ;;
+    *)
+      echo "::error::exec/async returned HTTP $START_HTTP: $(cat "$START_BODY")"
+      exit 1
+      ;;
+  esac
 
-  STDOUT_OFFSET=0
-  STDERR_OFFSET=0
-  EXIT_CODE=-1
-  while true; do
-    # --retry on transient 5xx (agent restart, brief CF blip) so a
-    # single bad poll doesn't fail an otherwise-healthy run mid-stream.
-    POLL=$(curl -fsS --retry 5 --retry-delay 1 --retry-all-errors \
-      -H "$AUTH" -H "User-Agent: $UA" \
-      "${SUPERJOLT_API_URL%/}/v1/vms/${VM_ID}/exec/${EXEC_ID}?stdoutOffset=${STDOUT_OFFSET}&stderrOffset=${STDERR_OFFSET}")
-    NEW_STDOUT=$(echo "$POLL" | jq -r '.stdout // ""')
-    NEW_STDERR=$(echo "$POLL" | jq -r '.stderr // ""')
-    [[ -n "$NEW_STDOUT" ]] && printf '%s' "$NEW_STDOUT"
-    [[ -n "$NEW_STDERR" ]] && printf '%s' "$NEW_STDERR" >&2
-    # Server returns the NEXT offset — clients are byte-counting-free.
-    STDOUT_OFFSET=$(echo "$POLL" | jq -r '.stdoutOffset // 0')
-    STDERR_OFFSET=$(echo "$POLL" | jq -r '.stderrOffset // 0')
-    STATUS=$(echo "$POLL" | jq -r '.status // "failed"')
-    case "$STATUS" in
-      running)
-        sleep 2
-        ;;
-      done)
-        EXIT_CODE=$(echo "$POLL" | jq -r '.exitCode // -1')
-        break
-        ;;
-      canceled|failed|lost)
-        ERR=$(echo "$POLL" | jq -r '.error // ""')
-        echo "::error::Remote command ended with status=${STATUS}${ERR:+ (${ERR})}"
-        exit 1
-        ;;
-      *)
-        echo "::error::Unexpected exec status: $STATUS"
-        exit 1
-        ;;
-    esac
-  done
+  if [[ "$ASYNC_AVAILABLE" == "true" ]]; then
+    EXEC_ID=$(jq -r '.execId // ""' < "$START_BODY")
+    if [[ -z "$EXEC_ID" ]]; then
+      echo "::error::exec/async returned 200 but no execId: $(cat "$START_BODY")"
+      exit 1
+    fi
+    rm -f "$START_BODY"
 
-  trap - INT TERM
-  if [[ "$EXIT_CODE" != "0" ]]; then
-    echo "::error::Remote command exited with $EXIT_CODE"
-    exit "$EXIT_CODE"
+    # Trap SIGTERM/SIGINT (the workflow runner sends these on cancel)
+    # so the underlying child gets SIGTERM-then-SIGKILL on vm-init
+    # instead of leaking. Best-effort: if the DELETE fails we still exit.
+    cleanup_exec() {
+      curl -fsS -X DELETE -H "$AUTH" -H "User-Agent: $UA" \
+        "${SUPERJOLT_API_URL%/}/v1/vms/${VM_ID}/exec/${EXEC_ID}" >/dev/null 2>&1 || true
+    }
+    trap 'cleanup_exec; exit 130' INT TERM
+
+    STDOUT_OFFSET=0
+    STDERR_OFFSET=0
+    EXIT_CODE=-1
+    POLL_ERROR=""
+    while true; do
+      # --retry on transient 5xx (agent restart, brief CF blip) so a
+      # single bad poll doesn't fail an otherwise-healthy run mid-stream.
+      POLL=$(curl -fsS --retry 5 --retry-delay 1 --retry-all-errors \
+        -H "$AUTH" -H "User-Agent: $UA" \
+        "${SUPERJOLT_API_URL%/}/v1/vms/${VM_ID}/exec/${EXEC_ID}?stdoutOffset=${STDOUT_OFFSET}&stderrOffset=${STDERR_OFFSET}")
+      NEW_STDOUT=$(echo "$POLL" | jq -r '.stdout // ""')
+      NEW_STDERR=$(echo "$POLL" | jq -r '.stderr // ""')
+      [[ -n "$NEW_STDOUT" ]] && printf '%s' "$NEW_STDOUT"
+      [[ -n "$NEW_STDERR" ]] && printf '%s' "$NEW_STDERR" >&2
+      # Server returns the NEXT offset — clients are byte-counting-free.
+      STDOUT_OFFSET=$(echo "$POLL" | jq -r '.stdoutOffset // 0')
+      STDERR_OFFSET=$(echo "$POLL" | jq -r '.stderrOffset // 0')
+      STATUS=$(echo "$POLL" | jq -r '.status // "failed"')
+      case "$STATUS" in
+        running)
+          sleep 2
+          ;;
+        done)
+          EXIT_CODE=$(echo "$POLL" | jq -r '.exitCode // -1')
+          POLL_ERROR=$(echo "$POLL" | jq -r '.error // ""')
+          break
+          ;;
+        canceled|failed|lost)
+          ERR=$(echo "$POLL" | jq -r '.error // ""')
+          echo "::error::Remote command ended with status=${STATUS}${ERR:+ — ${ERR}}"
+          exit 1
+          ;;
+        *)
+          echo "::error::Unexpected exec status: $STATUS"
+          exit 1
+          ;;
+      esac
+    done
+
+    trap - INT TERM
+    if [[ "$EXIT_CODE" != "0" ]]; then
+      echo "::error::Remote command exited with $EXIT_CODE${POLL_ERROR:+ — ${POLL_ERROR}}"
+      exit "$EXIT_CODE"
+    fi
+  else
+    # Sync fallback. timeoutMs capped at 900000ms (15 min) — matches
+    # the API's EXEC_MAX_TIMEOUT_MS. The actual ceiling on this path
+    # is whatever the edge tolerates (~100s on Cloudflare); the user
+    # has already been warned above.
+    SYNC_RES=$(curl -sS -o "$START_BODY" -w '%{http_code}' \
+      -X POST -H "$AUTH" -H "User-Agent: $UA" -H "Content-Type: application/json" \
+      -d "$(jq -n --arg c "$INPUT_COMMAND" --arg w "$WORKDIR" \
+           '{command: $c, workdir: $w, timeoutMs: 900000}')" \
+      "${SUPERJOLT_API_URL%/}/v1/vms/${VM_ID}/exec")
+    SYNC_BODY=$(cat "$START_BODY")
+    rm -f "$START_BODY"
+    if [[ "$SYNC_RES" != "200" ]]; then
+      echo "::error::sync /exec returned HTTP $SYNC_RES: $SYNC_BODY"
+      exit 1
+    fi
+    STDOUT=$(echo "$SYNC_BODY" | jq -r '.stdout // ""')
+    STDERR=$(echo "$SYNC_BODY" | jq -r '.stderr // ""')
+    EXIT_CODE=$(echo "$SYNC_BODY" | jq -r '.exitCode // -1')
+    ERROR=$(echo "$SYNC_BODY" | jq -r '.error // ""')
+    [[ -n "$STDOUT" ]] && echo "$STDOUT"
+    [[ -n "$STDERR" ]] && echo "$STDERR" >&2
+    if [[ "$EXIT_CODE" != "0" ]]; then
+      echo "::error::Remote command exited with $EXIT_CODE${ERROR:+ — ${ERROR}}"
+      exit "$EXIT_CODE"
+    fi
   fi
 fi
 

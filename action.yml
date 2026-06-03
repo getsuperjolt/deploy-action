@@ -56,5 +56,5 @@ runs:
         INPUT_UPLOAD_TO: ${{ inputs.upload_to }}
         INPUT_COMMAND: ${{ inputs.command }}
         INPUT_WORKDIR: ${{ inputs.workdir }}
-        ACTION_VERSION: '1.1.0'
+        ACTION_VERSION: '1.1.1'
       run: ${{ github.action_path }}/deploy.sh
